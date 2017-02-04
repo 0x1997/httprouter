@@ -37,17 +37,17 @@ package main
 
 import (
     "fmt"
-    "github.com/julienschmidt/httprouter"
-    "net/http"
+    "github.com/0x1997/httprouter"
+    "github.com/valyala/fasthttp"
     "log"
 )
 
-func Index(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-    fmt.Fprint(w, "Welcome!\n")
+func Index(ctx *fasthttp.RequestCtx) {
+    fmt.Fprint(ctx, "Welcome!\n")
 }
 
-func Hello(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-    fmt.Fprintf(w, "hello, %s!\n", ps.ByName("name"))
+func Hello(ctx *fasthttp.RequestCtx) {
+    fmt.Fprintf(ctx, "hello, %s!\n", ctx.UserValue("name"))
 }
 
 func main() {
@@ -55,7 +55,7 @@ func main() {
     router.GET("/", Index)
     router.GET("/hello/:name", Hello)
 
-    log.Fatal(http.ListenAndServe(":8080", router))
+    log.Fatal(fasthttp.ListenAndServe(":8080", router.Handler))
 }
 ```
 
@@ -125,18 +125,6 @@ For even better scalability, the child nodes on each tree level are ordered by p
 └-
 ```
 
-## Why doesn't this work with `http.Handler`?
-
-**It does!** The router itself implements the `http.Handler` interface. Moreover the router provides convenient [adapters for `http.Handler`][Router.Handler]s and [`http.HandlerFunc`][Router.HandlerFunc]s which allows them to be used as a [`httprouter.Handle`][Router.Handle] when registering a route. The only disadvantage is, that no parameter values can be retrieved when a `http.Handler` or `http.HandlerFunc` is used, since there is no efficient way to pass the values with the existing function parameters. Therefore [`httprouter.Handle`][Router.Handle] has a third function parameter.
-
-Just try it out for yourself, the usage of HttpRouter is very straightforward. The package is compact and minimalistic, but also probably one of the easiest routers to set up.
-
-## Where can I find Middleware *X*?
-
-This package just provides a very efficient request router with a few extra features. The router is just a [`http.Handler`][http.Handler], you can chain any http.Handler compatible middleware before the router, for example the [Gorilla handlers](http://www.gorillatoolkit.org/pkg/handlers). Or you could [just write your own](https://justinas.org/writing-http-middleware-in-go/), it's very easy!
-
-Alternatively, you could try [a web framework based on HttpRouter](#web-frameworks-based-on-httprouter).
-
 ### Multi-domain / Sub-domains
 
 Here is a quick example: Does your server serve multiple domains / hosts?
@@ -147,17 +135,18 @@ Define a router per host!
 // We need an object that implements the http.Handler interface.
 // Therefore we need a type for which we implement the ServeHTTP method.
 // We just use a map here, in which we map host names (with port) to http.Handlers
-type HostSwitch map[string]http.Handler
+type HostSwitch map[string]fasthttp.RequestHandler
 
 // Implement the ServerHTTP method on our new type
-func (hs HostSwitch) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Check if a http.Handler is registered for the given host.
+func (hs HostSwitch) Handler(ctx *fasthttp.RequestCtx) {
+	// Check if a fasthttp.RequestHandler is registered for the given host.
 	// If yes, use it to handle the request.
-	if handler := hs[r.Host]; handler != nil {
-		handler.ServeHTTP(w, r)
+	if handler := hs[string(ctx.Host())]; handler != nil {
+		handler(ctx)
 	} else {
 		// Handle host names for wich no handler is registered
-		http.Error(w, "Forbidden", 403) // Or Redirect?
+		ctx.Error(fasthttp.StatusMessage(fasthttp.StatusForbidden),
+			fasthttp.StatusForbidden) // Or Redirect?
 	}
 }
 
@@ -173,7 +162,7 @@ func main() {
 	hs["example.com:12345"] = router
 
 	// Use the HostSwitch to listen and serve on port 12345
-	log.Fatal(http.ListenAndServe(":12345", hs))
+	log.Fatal(fasthttp.ListenAndServe(":12345", hs.Handler))
 }
 ```
 
@@ -185,46 +174,81 @@ Another quick example: Basic Authentication (RFC 2617) for handles:
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"log"
-	"net/http"
+	"strings"
 
-	"github.com/julienschmidt/httprouter"
+	"github.com/0x1997/httprouter"
+	"github.com/valyala/fasthttp"
 )
 
-func BasicAuth(h httprouter.Handle, requiredUser, requiredPassword string) httprouter.Handle {
-	return func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+// basicAuth returns the username and password provided in the request's
+// Authorization header, if the request uses HTTP Basic Authentication.
+// See RFC 2617, Section 2.
+func basicAuth(ctx *fasthttp.RequestCtx) (username, password string, ok bool) {
+	auth := ctx.Request.Header.Peek("Authorization")
+	if auth == nil {
+		return
+	}
+	return parseBasicAuth(string(auth))
+}
+
+// parseBasicAuth parses an HTTP Basic Authentication string.
+// "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==" returns ("Aladdin", "open sesame", true).
+func parseBasicAuth(auth string) (username, password string, ok bool) {
+	const prefix = "Basic "
+	if !strings.HasPrefix(auth, prefix) {
+		return
+	}
+	c, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
+	if err != nil {
+		return
+	}
+	cs := string(c)
+	s := strings.IndexByte(cs, ':')
+	if s < 0 {
+		return
+	}
+	return cs[:s], cs[s+1:], true
+}
+
+// BasicAuth is the basic auth handler
+func BasicAuth(h fasthttp.RequestHandler, requiredUser, requiredPassword string) fasthttp.RequestHandler {
+	return fasthttp.RequestHandler(func(ctx *fasthttp.RequestCtx) {
 		// Get the Basic Authentication credentials
-		user, password, hasAuth := r.BasicAuth()
+		user, password, hasAuth := basicAuth(ctx)
 
 		if hasAuth && user == requiredUser && password == requiredPassword {
 			// Delegate request to the given handle
-			h(w, r, ps)
-		} else {
-			// Request Basic Authentication otherwise
-			w.Header().Set("WWW-Authenticate", "Basic realm=Restricted")
-			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			h(ctx)
+			return
 		}
-	}
+		// Request Basic Authentication otherwise
+		ctx.Error(fasthttp.StatusMessage(fasthttp.StatusUnauthorized), fasthttp.StatusUnauthorized)
+		ctx.Response.Header.Set("WWW-Authenticate", "Basic realm=Restricted")
+	})
 }
 
-func Index(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	fmt.Fprint(w, "Not protected!\n")
+// Index is the index handler
+func Index(ctx *fasthttp.RequestCtx) {
+	fmt.Fprint(ctx, "Not protected!\n")
 }
 
-func Protected(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
-	fmt.Fprint(w, "Protected!\n")
+// Protected is the Protected handler
+func Protected(ctx *fasthttp.RequestCtx) {
+	fmt.Fprint(ctx, "Protected!\n")
 }
 
 func main() {
 	user := "gordon"
 	pass := "secret!"
 
-	router := httprouter.New()
+	router := fasthttprouter.New()
 	router.GET("/", Index)
 	router.GET("/protected/", BasicAuth(Protected, user, pass))
 
-	log.Fatal(http.ListenAndServe(":8080", router))
+	log.Fatal(fasthttp.ListenAndServe(":8080", router.Handler))
 }
 ```
 
@@ -232,7 +256,7 @@ func main() {
 
 **NOTE: It might be required to set [`Router.HandleMethodNotAllowed`][Router.HandleMethodNotAllowed] to `false` to avoid problems.**
 
-You can use another [`http.Handler`][http.Handler], for example another router, to handle requests which could not be matched by this router by using the [`Router.NotFound`][Router.NotFound] handler. This allows chaining.
+You can use another [`fasthttp.RequestHandler`][fasthttp.RequestHandler], for example another router, to handle requests which could not be matched by this router by using the [`Router.NotFound`][Router.NotFound] handler. This allows chaining.
 
 ### Static files
 
@@ -240,37 +264,7 @@ The `NotFound` handler can for example be used to serve static files from the ro
 
 ```go
 // Serve static files from the ./public directory
-router.NotFound = http.FileServer(http.Dir("public"))
+router.NotFound = fasthttp.FSHandler("./public", 0)
 ```
 
 But this approach sidesteps the strict core rules of this router to avoid routing problems. A cleaner approach is to use a distinct sub-path for serving files, like `/static/*filepath` or `/files/*filepath`.
-
-## Web Frameworks based on HttpRouter
-
-If the HttpRouter is a bit too minimalistic for you, you might try one of the following more high-level 3rd-party web frameworks building upon the HttpRouter package:
-
-* [Ace](https://github.com/plimble/ace): Blazing fast Go Web Framework
-* [api2go](https://github.com/manyminds/api2go): A JSON API Implementation for Go
-* [Gin](https://github.com/gin-gonic/gin): Features a martini-like API with much better performance
-* [Goat](https://github.com/bahlo/goat): A minimalistic REST API server in Go
-* [Hikaru](https://github.com/najeira/hikaru): Supports standalone and Google AppEngine
-* [Hitch](https://github.com/nbio/hitch): Hitch ties httprouter, [httpcontext](https://github.com/nbio/httpcontext), and middleware up in a bow
-* [httpway](https://github.com/corneldamian/httpway): Simple middleware extension with context for httprouter and a server with gracefully shutdown support
-* [kami](https://github.com/guregu/kami): A tiny web framework using x/net/context
-* [Medeina](https://github.com/imdario/medeina): Inspired by Ruby's Roda and Cuba
-* [Neko](https://github.com/rocwong/neko): A lightweight web application framework for Golang
-* [River](https://github.com/abiosoft/river): River is a simple and lightweight REST server
-* [Roxanna](https://github.com/iamthemuffinman/Roxanna): An amalgamation of httprouter, better logging, and hot reload
-* [siesta](https://github.com/VividCortex/siesta): Composable HTTP handlers with contexts
-* [xmux](https://github.com/rs/xmux): xmux is a httprouter fork on top of xhandler (net/context aware)
-
-[benchmark]: <https://github.com/julienschmidt/go-http-routing-benchmark>
-[http.Handler]: <https://golang.org/pkg/net/http/#Handler
-[http.ServeMux]: <https://golang.org/pkg/net/http/#ServeMux>
-[Router.Handle]: <https://godoc.org/github.com/julienschmidt/httprouter#Router.Handle>
-[Router.HandleMethodNotAllowed]: <https://godoc.org/github.com/julienschmidt/httprouter#Router.HandleMethodNotAllowed>
-[Router.Handler]: <https://godoc.org/github.com/julienschmidt/httprouter#Router.Handler>
-[Router.HandlerFunc]: <https://godoc.org/github.com/julienschmidt/httprouter#Router.HandlerFunc>
-[Router.NotFound]: <https://godoc.org/github.com/julienschmidt/httprouter#Router.NotFound>
-[Router.PanicHandler]: <https://godoc.org/github.com/julienschmidt/httprouter#Router.PanicHandler>
-[Router.ServeFiles]: <https://godoc.org/github.com/julienschmidt/httprouter#Router.ServeFiles>
